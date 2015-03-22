@@ -152,7 +152,7 @@ var g = this;
           encrypt(localKey, subscription.p256dh, salt, data),
           // 1337 p-256 specific haxx to get the raw value out of the spki value
           crypto.exportKey('spki', localKey.publicKey)
-            .then(spki => spki.slice(23))
+            .then(spki => spki.slice(spkiPrefix.length))
         ]);
       }).then(results => {
         return fetch(subscription.endpoint, {
