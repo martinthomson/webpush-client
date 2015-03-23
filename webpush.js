@@ -13,7 +13,7 @@ var g = this;
     name: 'ECDH',
     namedCurve: 'P-256'
   };
-  var crypto = g.crypto.subtle;
+  var webCrypto = g.crypto.subtle;
   var INFO = new TextEncoder('utf-8').encode("Content-Encoding: aesgcm128");
 
   function chunkArray(array, size) {
@@ -34,15 +34,32 @@ var g = this;
 
   /* I can't believe that this is needed here, in this day and age ... */
   var base64url = {
+    _strmap: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_',
     encode: function(data) {
-      var strmap = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-      var len = Math.ceil(data.length / 3 * 4);
+      var len = Math.ceil(data.length * 4 / 3);
       return chunkArray(data, 3).map(chunk => [
         chunk[0] >>> 2,
         ((chunk[0] & 0x3) << 4) | (chunk[1] >>> 4),
         ((chunk[1] & 0xf) << 2) | (chunk[2] >>> 6),
         chunk[2] & 0x3f
-      ].map(v => strmap[v]).join('')).join('').slice(0, len);
+      ].map(v => base64url._strmap[v]).join('')).join('').slice(0, len);
+    },
+    _lookup: function(s, i) {
+      return base64url._strmap.indexOf(s.charAt(i));
+    },
+    decode: function(str) {
+      var v = new Uint8Array(Math.floor(str.length * 3 / 4));
+      var vi = 0;
+      for (var si = 0; si < str.length;) {
+        var w = base64url._lookup(str, si++);
+        var x = base64url._lookup(str, si++);
+        var y = base64url._lookup(str, si++);
+        var z = base64url._lookup(str, si++);
+        v[vi++] = w << 2 | x >>> 4;
+        v[vi++] = x << 4 | y >>> 2;
+        v[vi++] = y << 6 | z;
+      }
+      return v;
     }
   };
 
@@ -62,33 +79,38 @@ var g = this;
 
   function concatArrayViews(arrays) {
     var size = arrays.reduce((total, a) => total + a.length, 0);
+    var result = new Uint8Array(size);
     var index = 0;
-    return arrays.reduce((result, a) => {
+    arrays.forEach(a => {
       result.set(a, index);
       index += a.length;
-    }, new Uint8Array(size));
+    });
+    return result;
   }
 
   function hmac(key) {
-    this.keyPromise = crypto.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' },
-                                       false, ['sign']);
+    this.keyPromise = webCrypto.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' },
+                                          false, ['sign']);
   }
   hmac.prototype.hash = function(input) {
-    return this.keyPromise.then(k => crypto.sign('HMAC', k, input));
+    return this.keyPromise.then(k => webCrypto.sign('HMAC', k, input));
   }
 
   function hkdf(salt, ikm, info, len) {
-    return new hmac(salt).hash(ikm).then(prk => new hmac(prk))
+    return new hmac(salt).hash(ikm)
+      .then(prk => new hmac(prk))
       .then(prkh => {
         var output = [];
         var counter = new Uint8Array(1);
 
         function hkdf_iter(t) {
+          console.log('hkdf_iter', output);
           if (++counter[0] === 0) {
             throw new Error('Too many hmac invocations for hkdf');
           }
-          return pkrh.hash(concatArrayViews(t, info, counter))
+          return prkh.hash(concatArrayViews([new Uint8Array(t), info, counter]))
             .then(tnext => {
+              tnext = new Uint8Array(tnext);
               output.push(tnext);
               if (output.reduce((sum, a) => sum + a.length, 0) >= len) {
                 return output;
@@ -118,18 +140,18 @@ var g = this;
   ]);
 
   function encrypt(localKey, remoteShare, salt, data) {
-    return crypto.importKey('spki', concatArrayViews(spkiPrefix, remoteShare),
-                                            P256DH, false, ['deriveBits'])
+    return webCrypto.importKey('spki', concatArrayViews([spkiPrefix, remoteShare]),
+                               P256DH, false, ['deriveBits'])
       .then(remoteKey =>
-            crypto.deriveBits({ name: P256DH.name, public: remoteKey },
-                              localKey, 'AES-GCM', false, ['encrypt']))
+            webCrypto.deriveBits({ name: P256DH.name, public: remoteKey },
+                                 localKey, 'AES-GCM', false, ['encrypt']))
       .then(rawKey => hkdf(salt, rawKey, INFO, 16))
       .then(gcmKey => {
         // 4096 is the default size, though we burn 1 for padding
         return concatArrayViews(chunkArray(data, 4095).map((slice, index) => {
-          var padded = concatArrayViews(new Uint8Array(1), slice);
-          return crypto.encrypt({ name: 'AES-GCM', iv: generateIV(index) },
-                                gcmKey, padded);
+          var padded = concatArrayViews([new Uint8Array(1), slice]);
+          return webCrypto.encrypt({ name: 'AES-GCM', iv: generateIV(index) },
+                                   gcmKey, padded);
         }));
       });
   }
@@ -146,12 +168,12 @@ var g = this;
     data = ensureView(data);
 
     var salt = g.crypto.getRandomValues(new Uint8Array(16));
-    return crypto.generateKey(P256DH, false, ['deriveBits'])
+    return webCrypto.generateKey(P256DH, false, ['deriveBits'])
       .then(localKey => {
         return Promise.all([
           encrypt(localKey, subscription.p256dh, salt, data),
           // 1337 p-256 specific haxx to get the raw value out of the spki value
-          crypto.exportKey('spki', localKey.publicKey)
+          webCrypto.exportKey('spki', localKey.publicKey)
             .then(spki => spki.slice(spkiPrefix.length))
         ]);
       }).then(results => {
