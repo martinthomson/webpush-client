@@ -1,13 +1,12 @@
 /*
  * Browser-based Web Push client for the application server piece.
  *
- * Uses the WebCrypto API.
- * Uses the fetch API, which might need to be polyfilled:
- * <https://github.com/github/fetch>.
+ * Uses the WebCrypto API.  Polyfill: http://polycrypt.net/
+ * Uses the fetch API.  Polyfill: https://github.com/github/fetch
  */
 
-//(function (g) {
-var g = this;
+(function (g) {
+  'use strict';
 
   var P256DH = {
     name: 'ECDH',
@@ -69,10 +68,10 @@ var g = this;
       return new TextEncoder('utf-8').encode(data);
     }
     if (data instanceof ArrayBuffer) {
-      return Uint8Array.from(data);
+      return new Uint8Array(data);
     }
     if (ArrayBuffer.isView(data)) {
-      return Uint8Array.from(data.buffer);
+      return new Uint8Array(data.buffer);
     }
     throw new Error('webpush() needs a string or BufferSource');
   }
@@ -104,11 +103,10 @@ var g = this;
         var counter = new Uint8Array(1);
 
         function hkdf_iter(t) {
-          console.log('hkdf_iter', output);
           if (++counter[0] === 0) {
             throw new Error('Too many hmac invocations for hkdf');
           }
-          return prkh.hash(concatArrayViews([new Uint8Array(t), info, counter]))
+          return prkh.hash(concatArrayViews([t, info, counter]))
             .then(tnext => {
               tnext = new Uint8Array(tnext);
               output.push(tnext);
@@ -127,7 +125,7 @@ var g = this;
   /* generate a 96-bit IV for use in GCM, 48-bits of which are populated */
   function generateIV(index) {
     var iv = new Uint8Array(12);
-    for (i = 0; i < 6; ++i) {
+    for (var i = 0; i < 6; ++i) {
       iv[iv.length - 1 - i] = (index / Math.pow(256, i)) & 0xff;
     }
     return iv;
@@ -144,16 +142,19 @@ var g = this;
                                P256DH, false, ['deriveBits'])
       .then(remoteKey =>
             webCrypto.deriveBits({ name: P256DH.name, public: remoteKey },
-                                 localKey, 'AES-GCM', false, ['encrypt']))
-      .then(rawKey => hkdf(salt, rawKey, INFO, 16))
+                                 localKey, 256))
+      .then(rawKey =>
+            hkdf(salt, new Uint8Array(rawKey), INFO, 16))
+      .then(gcmBits =>
+            webCrypto.importKey('raw', gcmBits, 'AES-GCM', false, ['encrypt']))
       .then(gcmKey => {
         // 4096 is the default size, though we burn 1 for padding
-        return concatArrayViews(chunkArray(data, 4095).map((slice, index) => {
+        return Promise.all(chunkArray(data, 4095).map((slice, index) => {
           var padded = concatArrayViews([new Uint8Array(1), slice]);
           return webCrypto.encrypt({ name: 'AES-GCM', iv: generateIV(index) },
                                    gcmKey, padded);
         }));
-      });
+      }).then(r => concatArrayViews(r.map(a => new Uint8Array(a))));
   }
 
   /*
@@ -171,19 +172,19 @@ var g = this;
     return webCrypto.generateKey(P256DH, false, ['deriveBits'])
       .then(localKey => {
         return Promise.all([
-          encrypt(localKey, subscription.p256dh, salt, data),
+          encrypt(localKey.privateKey, subscription.p256dh, salt, data),
           // 1337 p-256 specific haxx to get the raw value out of the spki value
           webCrypto.exportKey('spki', localKey.publicKey)
-            .then(spki => spki.slice(spkiPrefix.length))
+            .then(spki => new Uint8Array(spki, spkiPrefix.length))
         ]);
       }).then(results => {
         return fetch(subscription.endpoint, {
           method: 'PUT',
           headers: {
-            'Encryption-Key': 'keyid=p256dh;dh=' + base64url.encode(result[1]),
+            'Encryption-Key': 'keyid=p256dh;dh=' + base64url.encode(results[1]),
             Encryption: 'keyid=p256dh;salt=' + base64url.encode(salt)
           },
-          body: result[0]
+          body: results[0]
         });
       }).then(response => {
         if (response.status / 100 !== 2) {
@@ -193,4 +194,4 @@ var g = this;
   }
 
   g.webpush = webpush;
-//}(this));
+}(this));
