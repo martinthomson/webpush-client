@@ -1,7 +1,7 @@
 /*
  * Browser-based Web Push client for the application server piece.
  *
- * Uses the WebCrypto API.  Polyfill: http://polycrypt.net/
+ * Uses the WebCrypto API.
  * Uses the fetch API.  Polyfill: https://github.com/github/fetch
  */
 
@@ -13,28 +13,30 @@
     namedCurve: 'P-256'
   };
   var webCrypto = g.crypto.subtle;
-  var INFO = new TextEncoder('utf-8').encode("Content-Encoding: aesgcm128");
+  var ENCRYPT_INFO = new TextEncoder('utf-8').encode("Content-Encoding: aesgcm128");
+  var NONCE_INFO = new TextEncoder('utf-8').encode("Content-Encoding: nonce");
 
   function chunkArray(array, size) {
+    array = array.buffer || array;
     var index = 0;
     var result = [];
-    while(index + size <= array.length) {
-      result.push(array.slice(index, index + size));
+    while(index + size <= array.byteLength) {
+      result.push(new Uint8Array(array, index, size));
       index += size;
     }
-    if (index < array.length) {
-      result.push(array.slice(index));
-    }
-    if (result.length === 0) {
-      result.push(new Uint8Array(0));
+    if (index <= array.byteLength) {
+      result.push(new Uint8Array(array, index));
     }
     return result;
   }
 
-  /* I can't believe that this is needed here, in this day and age ... */
+  /* I can't believe that this is needed here, in this day and age ...
+   * Note: these are not efficient, merely expedient.
+   */
   var base64url = {
     _strmap: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_',
     encode: function(data) {
+      data = new Uint8Array(data);
       var len = Math.ceil(data.length * 4 / 3);
       return chunkArray(data, 3).map(chunk => [
         chunk[0] >>> 2,
@@ -62,6 +64,8 @@
     }
   };
 
+  g.base64url = base64url;
+
   /* Coerces data into a Uint8Array */
   function ensureView(data) {
     if (typeof data === 'string') {
@@ -76,15 +80,14 @@
     throw new Error('webpush() needs a string or BufferSource');
   }
 
-  function concatArrayViews(arrays) {
-    var size = arrays.reduce((total, a) => total + a.length, 0);
-    var result = new Uint8Array(size);
+  function bsConcat(arrays) {
+    var size = arrays.reduce((total, a) => total + a.byteLength, 0);
     var index = 0;
-    arrays.forEach(a => {
-      result.set(a, index);
-      index += a.length;
-    });
-    return result;
+    return arrays.reduce((result, a) => {
+      result.set(new Uint8Array(a), index);
+      index += a.byteLength;
+      return result;
+    }, new Uint8Array(size));
   }
 
   function hmac(key) {
@@ -95,66 +98,65 @@
     return this.keyPromise.then(k => webCrypto.sign('HMAC', k, input));
   }
 
-  function hkdf(salt, ikm, info, len) {
-    return new hmac(salt).hash(ikm)
-      .then(prk => new hmac(prk))
-      .then(prkh => {
-        var output = [];
-        var counter = new Uint8Array(1);
-
-        function hkdf_iter(t) {
-          if (++counter[0] === 0) {
-            throw new Error('Too many hmac invocations for hkdf');
-          }
-          return prkh.hash(concatArrayViews([t, info, counter]))
-            .then(tnext => {
-              tnext = new Uint8Array(tnext);
-              output.push(tnext);
-              if (output.reduce((sum, a) => sum + a.length, 0) >= len) {
-                return output;
-              }
-              return hkdf_iter(tnext);
-            });
-        }
-
-        return hkdf_iter(new Uint8Array(0));
-      })
-      .then(chunks => concatArrayViews(chunks).slice(0, len));
+  function hkdf(salt, ikm) {
+    this.prkhPromise = new hmac(salt).hash(ikm)
+      .then(prk => new hmac(prk));
   }
+
+  hkdf.prototype.generate = function(info, len) {
+    var input = bsConcat([info, new Uint8Array([1])]);
+    return this.prkhPromise
+      .then(prkh => prkh.hash(input))
+      .then(h => {
+        if (h.byteLength < len) {
+          throw new Error('Length is too long');
+        }
+        return h.slice(0, len);
+      });
+  };
+
+  Promise.allMap = function(o) {
+    var result = {};
+    return Promise.all(
+      Object.keys(o).map(
+        k => Promise.resolve(o[k]).then(r => result[k] = r)
+      )
+    ).then(_ => result);
+  };
 
   /* generate a 96-bit IV for use in GCM, 48-bits of which are populated */
-  function generateIV(index) {
-    var iv = new Uint8Array(12);
+  function generateNonce(base, index) {
+    var nonce = base.slice(0, 12);
     for (var i = 0; i < 6; ++i) {
-      iv[iv.length - 1 - i] = (index / Math.pow(256, i)) & 0xff;
+      nonce[nonce.length - 1 - i] ^= (index / Math.pow(256, i)) & 0xff;
     }
-    return iv;
+    return nonce;
   }
 
-  // DER encoding describing an ECDH public key on P-256
-  var spkiPrefix = Uint8Array.from([
-    48, 86, 48, 16, 6, 4, 43, 129, 4, 112, 6, 8,
-    42, 134, 72, 206, 61, 3, 1, 7, 3, 66, 0
-  ]);
-
   function encrypt(localKey, remoteShare, salt, data) {
-    return webCrypto.importKey('spki', concatArrayViews([spkiPrefix, remoteShare]),
-                               P256DH, false, ['deriveBits'])
+    return webCrypto.importKey('raw', remoteShare, P256DH, false, ['deriveBits'])
       .then(remoteKey =>
             webCrypto.deriveBits({ name: P256DH.name, public: remoteKey },
                                  localKey, 256))
-      .then(rawKey =>
-            hkdf(salt, new Uint8Array(rawKey), INFO, 16))
-      .then(gcmBits =>
-            webCrypto.importKey('raw', gcmBits, 'AES-GCM', false, ['encrypt']))
-      .then(gcmKey => {
+      .then(rawKey => {
+        var kdf = new hkdf(salt, rawKey);
+        return Promise.allMap({
+          key: kdf.generate(ENCRYPT_INFO, 16)
+            .then(gcmBits =>
+                  webCrypto.importKey('raw', gcmBits, 'AES-GCM', false, ['encrypt'])),
+          nonce: kdf.generate(NONCE_INFO, 12)
+        })
+      })
+      .then(r => {
         // 4096 is the default size, though we burn 1 for padding
         return Promise.all(chunkArray(data, 4095).map((slice, index) => {
-          var padded = concatArrayViews([new Uint8Array(1), slice]);
-          return webCrypto.encrypt({ name: 'AES-GCM', iv: generateIV(index) },
-                                   gcmKey, padded);
+          var padded = bsConcat([new Uint8Array([0]), slice]);
+          return webCrypto.encrypt({
+            name: 'AES-GCM',
+            iv: generateNonce(r.nonce, index)
+          }, r.key, padded);
         }));
-      }).then(r => concatArrayViews(r.map(a => new Uint8Array(a))));
+      }).then(bsConcat);
   }
 
   /*
@@ -171,21 +173,22 @@
     var salt = g.crypto.getRandomValues(new Uint8Array(16));
     return webCrypto.generateKey(P256DH, false, ['deriveBits'])
       .then(localKey => {
-        return Promise.all([
-          encrypt(localKey.privateKey, subscription.p256dh, salt, data),
+        return Promise.allMap({
+          payload: encrypt(localKey.privateKey, subscription.p256dh, salt, data),
           // 1337 p-256 specific haxx to get the raw value out of the spki value
-          webCrypto.exportKey('spki', localKey.publicKey)
-            .then(spki => new Uint8Array(spki, spkiPrefix.length))
-        ]);
+          pubkey: webCrypto.exportKey('raw', localKey.publicKey)
+        });
       }).then(results => {
-        return fetch(subscription.endpoint, {
+        var options = {
           method: 'PUT',
           headers: {
-            'Encryption-Key': 'keyid=p256dh;dh=' + base64url.encode(results[1]),
-            Encryption: 'keyid=p256dh;salt=' + base64url.encode(salt)
+            'Encryption-Key': 'keyid=p256dh;dh=' + base64url.encode(results.pubkey),
+            Encryption: 'keyid=p256dh;salt=' + base64url.encode(salt),
+            'Content-Encoding': 'aesgcm128'
           },
-          body: results[0]
-        });
+          body: results.payload
+        };
+        return fetch(subscription.endpoint, options);
       }).then(response => {
         if (response.status / 100 !== 2) {
           throw new Error('Unable to deliver message');
