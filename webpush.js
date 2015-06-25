@@ -17,15 +17,16 @@
   var NONCE_INFO = new TextEncoder('utf-8').encode("Content-Encoding: nonce");
 
   function chunkArray(array, size) {
+    var start = array.byteOffset || 0;
     array = array.buffer || array;
     var index = 0;
     var result = [];
     while(index + size <= array.byteLength) {
-      result.push(new Uint8Array(array, index, size));
+      result.push(new Uint8Array(array, start + index, size));
       index += size;
     }
     if (index <= array.byteLength) {
-      result.push(new Uint8Array(array, index));
+      result.push(new Uint8Array(array, start + index));
     }
     return result;
   }
